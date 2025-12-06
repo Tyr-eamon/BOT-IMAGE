@@ -1,267 +1,236 @@
-"""Telegram photo collection bot backed by Cloudflare KV storage."""
-
-from __future__ import annotations
-
-import asyncio
+import os
 import json
 import logging
-import os
-from typing import Dict, List, Optional
-
 import requests
 from telegram import Update
 from telegram.ext import (
-    Application,
-    CommandHandler,
-    ContextTypes,
-    MessageHandler,
-    filters,
+    ApplicationBuilder, CommandHandler,
+    MessageHandler, ContextTypes, filters
 )
 
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
-)
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-ALBUM_STATE_KEY = "album_state"
-ALBUM_SEQUENCE_KEY = "_album_sequence"
+BOT_TOKEN = os.environ["BOT_TOKEN"]
+CF_ACCOUNT_ID = os.environ["CF_ACCOUNT_ID"]
+CF_NAMESPACE_ID = os.environ["CF_NAMESPACE_ID"]
+CF_API_TOKEN = os.environ["CF_API_TOKEN"]
+WORKER_BASE_URL = os.getenv("WORKER_BASE_URL", "https://example.workers.dev")
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-CF_ACCOUNT_ID = os.getenv("CF_ACCOUNT_ID")
-CF_NAMESPACE_ID = os.getenv("CF_NAMESPACE_ID")
-CF_API_TOKEN = os.getenv("CF_API_TOKEN")
-WORKER_BASE_URL = (os.getenv("WORKER_BASE_URL") or "").rstrip("/")
+# user_id -> 临时图包数据
+current_albums = {}
+COUNTER_KEY = "__counter"
 
 
-class CloudflareKVClient:
-    """Thin wrapper around the Cloudflare KV REST API."""
+# ---------- Cloudflare KV ----------
+def kv_headers():
+    return {
+        "Authorization": f"Bearer {CF_API_TOKEN}",
+        "Content-Type": "text/plain",
+    }
 
-    def __init__(self, account_id: str, namespace_id: str, api_token: str) -> None:
-        if not all([account_id, namespace_id, api_token]):
-            raise ValueError("Missing Cloudflare KV configuration.")
-        self.base_url = (
-            f"https://api.cloudflare.com/client/v4/accounts/{account_id}"
-            f"/storage/kv/namespaces/{namespace_id}"
-        )
-        self.headers = {"Authorization": f"Bearer {api_token}"}
+def kv_base_url():
+    return f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/storage/kv/namespaces/{CF_NAMESPACE_ID}"
 
-    def _values_url(self, key: str) -> str:
-        return f"{self.base_url}/values/{key}"
+def kv_get(key: str):
+    url = f"{kv_base_url()}/values/{key}"
+    resp = requests.get(url, headers=kv_headers())
+    return resp.text if resp.status_code == 200 else None
 
-    def get_value(self, key: str) -> Optional[str]:
-        response = requests.get(self._values_url(key), headers=self.headers, timeout=10)
-        if response.status_code == 404:
-            return None
-        response.raise_for_status()
-        return response.text
+def kv_put(key: str, value: str):
+    url = f"{kv_base_url()}/values/{key}"
+    resp = requests.put(url, headers=kv_headers(), data=value.encode("utf-8"))
+    return resp.status_code == 200
 
-    def put_value(
-        self, key: str, value: str, content_type: str = "text/plain"
-    ) -> None:
-        headers = {**self.headers, "Content-Type": content_type}
-        response = requests.put(
-            self._values_url(key), headers=headers, data=value, timeout=10
-        )
-        response.raise_for_status()
-
-    def _next_sequence_index(self) -> int:
-        raw_value = self.get_value(ALBUM_SEQUENCE_KEY)
+def next_code() -> str:
+    cur = kv_get(COUNTER_KEY)
+    if cur is None:
+        n = 1
+    else:
         try:
-            current = int(raw_value) if raw_value is not None else 0
+            n = int(cur) + 1
         except ValueError:
-            logger.warning(
-                "Invalid sequence value '%s' detected, resetting counter to 0", raw_value
-            )
-            current = 0
-        return current + 1
+            n = 1
 
-    def save_album(self, payload: Dict[str, List[str]]) -> str:
-        next_index = self._next_sequence_index()
-        album_code = f"a{next_index:02d}"
-        self.put_value(
-            album_code,
-            json.dumps(payload, ensure_ascii=False),
-            content_type="application/json",
-        )
-        self.put_value(ALBUM_SEQUENCE_KEY, str(next_index))
-        return album_code
+    kv_put(COUNTER_KEY, str(n))
+
+    if n < 10:
+        return f"a0{n}"
+    return f"a{n}"
 
 
-def get_kv_client() -> CloudflareKVClient:
-    return CloudflareKVClient(CF_ACCOUNT_ID, CF_NAMESPACE_ID, CF_API_TOKEN)
+# ---------- Bot 逻辑 ----------
 
-
-def _ensure_message(update: Update):
-    message = update.effective_message
-    if message is None:
-        raise ValueError("Update does not contain a message context")
-    return message
-
-
-def _get_user_session(context: ContextTypes.DEFAULT_TYPE) -> Optional[Dict]:
-    return context.user_data.get(ALBUM_STATE_KEY)
-
-
-def _create_user_session(context: ContextTypes.DEFAULT_TYPE) -> None:
-    context.user_data[ALBUM_STATE_KEY] = {"title": None, "files": []}
-
-
-def _clear_user_session(context: ContextTypes.DEFAULT_TYPE) -> None:
-    context.user_data.pop(ALBUM_STATE_KEY, None)
-
-
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    message = _ensure_message(update)
-    welcome_message = (
-        "🤖 Welcome to the Photo Collection Bot!\n\n"
-        "Collect Telegram photos into Cloudflare KV-backed albums.\n\n"
-        "Available commands:\n"
-        "/start - Display this help message\n"
-        "/start_album - Begin recording a new album\n"
-        "/end_album - Save the active album to storage\n\n"
-        "Workflow:\n"
-        "1️⃣ Use /start_album\n"
-        "2️⃣ Send a message starting with # to set the album title\n"
-        "3️⃣ Send photos to collect their file_ids\n"
-        "4️⃣ Finish with /end_album"
-    )
-    await message.reply_text(welcome_message)
-
-
-async def start_album_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    message = _ensure_message(update)
-    if _get_user_session(context):
-        await message.reply_text(
-            "⚠️ You already have an active album. Use /end_album to finish it first."
-        )
-        return
-    _create_user_session(context)
-    await message.reply_text(
-        "📸 Album session started!\n"
-        "Send a title message beginning with # (e.g. #My Album) and then upload photos."
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "📸 写真图包 Bot 已就绪\n\n"
+        "/start_album  开始新图包\n"
+        "#标题          第一条以 # 开头的消息作为标题\n"
+        "发送图片       本套写真所有图片（可一次拖很多张）\n"
+        "/set_pass 1234 可选：给当前图包设置访问密码\n"
+        "发送文件       可选：zip/apk/txt等，会作为下载文件\n"
+        "/end_album     结束本套图包，生成链接\n"
     )
 
+async def start_album(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    current_albums[uid] = {
+        "title": None,
+        "files": [],          # photo file_id 列表
+        "attachments": [],    # 其他文件列表 {file_id, file_name}
+        "zip": None,          # {file_id, file_name}
+        "password": None,
+    }
+    await update.message.reply_text(
+        "🟦 已开始新的图包\n"
+        "请先发送标题（以 # 开头），例如：\n"
+        "#布丁大法 - 超甜舒芙蕾 [60P／276MB]\n"
+        "然后发送所有图片，可以一次拖很多张。\n"
+        "如需设置访问密码，可发送：/set_pass 1234\n"
+        "如需添加压缩包/APK/txt 等文件，直接发送文件。\n"
+        "最后用 /end_album 结束本套图包。"
+    )
 
-async def end_album_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    message = _ensure_message(update)
-    session = _get_user_session(context)
-    if not session:
-        await message.reply_text("❌ No active album. Use /start_album to begin.")
+async def end_album(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    album = current_albums.get(uid)
+    if not album:
+        await update.message.reply_text("你还没有开始图包，请先发送 /start_album")
         return
-    if not session.get("title"):
-        await message.reply_text(
-            "⚠️ Please set an album title first by sending a message that starts with #."
-        )
+
+    title = album["title"]
+    files = album["files"]
+
+    if not title:
+        await update.message.reply_text("还没有标题（需要一条以 # 开头的消息）")
         return
-    files = session.get("files", [])
     if not files:
-        await message.reply_text("⚠️ Add at least one photo before ending the album.")
+        await update.message.reply_text("你还没有发送任何图片。")
         return
-
-    await message.reply_text("💾 Saving album to Cloudflare KV...")
-
-    payload = {"title": session["title"], "files": list(files)}
 
     try:
-        album_code = await asyncio.to_thread(
-            context.bot_data["kv_client"].save_album, payload
+        code = next_code()
+    except Exception as e:
+        logger.exception("生成序列码失败")
+        await update.message.reply_text("生成序列码失败，请稍后重试。")
+        return
+
+    data = {
+        "title": title,
+        "files": files,
+        "attachments": album["attachments"],
+        "zip": album["zip"],
+        "password": album["password"],
+    }
+
+    ok = kv_put(code, json.dumps(data, ensure_ascii=False))
+    if not ok:
+        await update.message.reply_text("❌ 写入图包数据失败，请稍后再试。")
+        return
+
+    del current_albums[uid]
+
+    link = f"{WORKER_BASE_URL}/{code}"
+    await update.message.reply_text(
+        f"🎉 图包已创建！\n"
+        f"序列码：{code}\n"
+        f"访问链接：{link}\n\n"
+        f"你可以在网页打开，也可以访问 {WORKER_BASE_URL}/list 查看全部图包。"
+    )
+
+async def handle_title(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    album = current_albums.get(uid)
+    if not album:
+        return
+
+    text = (update.message.text or "").strip()
+    if text.startswith("#") and album["title"] is None:
+        album["title"] = text[1:].strip()
+        await update.message.reply_text(
+            f"✅ 标题已设置为：{album['title']}\n"
+            f"现在请继续发送本套写真所有图片。"
         )
-    except (requests.RequestException, ValueError) as exc:
-        logger.exception("Failed to save album")
-        await message.reply_text(
-            "❌ Could not save the album. Please try again later."
-        )
+
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    album = current_albums.get(uid)
+    if not album:
+        return
+    photos = update.message.photo
+    if not photos:
+        return
+    best = photos[-1]
+    file_id = best.file_id
+    album["files"].append(file_id)
+    logger.info(f"Add photo {file_id}")
+
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    album = current_albums.get(uid)
+    if not album:
         return
 
-    _clear_user_session(context)
-
-    response = (
-        f"✅ Album saved successfully!\n"
-        f"Code: {album_code}\n"
-        f"Title: {payload['title']}\n"
-        f"Photos stored: {len(payload['files'])}"
-    )
-    if WORKER_BASE_URL:
-        response += f"\nShare link: {WORKER_BASE_URL}/{album_code}"
-
-    await message.reply_text(response)
-
-
-async def handle_title(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    message = _ensure_message(update)
-    session = _get_user_session(context)
-    if not session:
+    doc = update.message.document
+    if not doc:
         return
 
-    text = (message.text or "").strip()
-    if not text.startswith("#"):
+    file_id = doc.file_id
+    file_name = doc.file_name or "file"
+    mime_type = doc.mime_type or "application/octet-stream"
+
+    # 记录到 attachments
+    album["attachments"].append({
+        "file_id": file_id,
+        "file_name": file_name,
+        "mime_type": mime_type,
+    })
+    logger.info(f"Add document {file_name} ({file_id})")
+
+    # 如是 zip/7z/rar，则设为 zip（仅第一次）
+    lname = file_name.lower()
+    if album["zip"] is None and (lname.endswith(".zip") or lname.endswith(".7z") or lname.endswith(".rar")):
+        album["zip"] = {
+            "file_id": file_id,
+            "file_name": file_name,
+            "mime_type": mime_type,
+        }
+        await update.message.reply_text(f"🎁 已设此文件为压缩包下载：{file_name}")
+
+async def set_pass(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    album = current_albums.get(uid)
+    if not album:
+        await update.message.reply_text("当前没有正在创建的图包，请先 /start_album。")
         return
 
-    title = text.lstrip("#").strip()
-    if not title:
-        await message.reply_text("❌ Title cannot be empty. Try again with #Your Title.")
+    text = update.message.text or ""
+    parts = text.strip().split(maxsplit=1)
+    if len(parts) < 2:
+        await update.message.reply_text("用法：/set_pass 你的密码\n例如：/set_pass 1234")
         return
 
-    session["title"] = title
-    await message.reply_text(
-        f"✅ Title set to: {title}. Now send photos to populate the album."
-    )
+    password = parts[1].strip()
+    album["password"] = password
+    await update.message.reply_text(f"🔒 已为当前图包设置密码：{password}\n访问网页时需要输入该密码。")
 
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await start(update, context)
 
-async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    message = _ensure_message(update)
-    session = _get_user_session(context)
-    if not session:
-        await message.reply_text("ℹ️ Start an album first with /start_album.")
-        return
-    if not session.get("title"):
-        await message.reply_text(
-            "⚠️ Set a title before uploading photos by sending a message starting with #."
-        )
-        return
+def main():
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    if not message.photo:
-        await message.reply_text("⚠️ Unable to read the photo payload. Please resend the image.")
-        return
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CommandHandler("start_album", start_album))
+    app.add_handler(CommandHandler("end_album", end_album))
+    app.add_handler(CommandHandler("set_pass", set_pass))
 
-    largest_photo = max(
-        message.photo, key=lambda p: p.file_size or 0  # pick the best quality variant
-    )
-    session.setdefault("files", []).append(largest_photo.file_id)
-    await message.reply_text(
-        f"📷 Photo added! Total photos in album: {len(session['files'])}."
-    )
+    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_title))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
 
-
-async def error_handler(update: Optional[Update], context: ContextTypes.DEFAULT_TYPE) -> None:
-    logger.exception("Unhandled error while processing update: %s", context.error)
-
-
-def build_application() -> Application:
-    if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN environment variable is required.")
-    if not all([CF_ACCOUNT_ID, CF_NAMESPACE_ID, CF_API_TOKEN]):
-        raise RuntimeError("Cloudflare KV environment variables are required.")
-    kv_client = get_kv_client()
-    application = Application.builder().token(BOT_TOKEN).build()
-    application.bot_data["kv_client"] = kv_client
-
-    application.add_handler(CommandHandler("start", start_command))
-    application.add_handler(CommandHandler("start_album", start_album_command))
-    application.add_handler(CommandHandler("end_album", end_album_command))
-    application.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_title)
-    )
-    application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
-    application.add_error_handler(error_handler)
-    return application
-
-
-def main() -> None:
-    application = build_application()
-    logger.info("Starting long polling...")
-    application.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+    app.run_polling()
 
 
 if __name__ == "__main__":

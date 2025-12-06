@@ -47,7 +47,7 @@ def kv_put(key: str, value: str):
 def kv_delete(key: str):
     url = f"{kv_base_url()}/values/{key}"
     resp = requests.delete(url, headers=kv_headers())
-    return resp.status_code == 204
+    return resp.status_code in (200, 204)
 
 def next_code() -> str:
     cur = kv_get(COUNTER_KEY)
@@ -77,26 +77,24 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/set_pass 1234 可选：给当前图包设置访问密码\n"
         "发送文件       可选：zip/apk/txt等，会作为下载文件\n"
         "/end_album     结束本套图包，生成链接\n"
+        "/delete a01    删除指定图包（yes/no 确认）\n"
     )
 
 async def start_album(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    logger.info(f"[start_album] User {uid} started a new album")
     current_albums[uid] = {
         "title": None,
-        "files": [],          # photo file_id 列表
-        "attachments": [],    # 其他文件列表 {file_id, file_name}
-        "zip": None,          # {file_id, file_name}
+        "files": [],
+        "attachments": [],
+        "zip": None,
         "password": None,
     }
-    logger.info(f"[start_album] Album created for user {uid}: {current_albums[uid]}")
     await update.message.reply_text(
         "🟦 已开始新的图包\n"
-        "请先发送标题（以 # 开头），例如：\n"
+        "请发送标题（以 # 开头），例如：\n"
         "#布丁大法 - 超甜舒芙蕾 [60P／276MB]\n"
         "然后发送所有图片，可以一次拖很多张。\n"
-        "如需设置访问密码，可发送：/set_pass 1234\n"
-        "如需添加压缩包/APK/txt 等文件，直接发送文件。\n"
+        "如需设置密码请发送：/set_pass 1234\n"
         "最后用 /end_album 结束本套图包。"
     )
 
@@ -104,255 +102,196 @@ async def end_album(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     album = current_albums.get(uid)
     if not album:
-        await update.message.reply_text("你还没有开始图包，请先发送 /start_album")
+        await update.message.reply_text("请先发送 /start_album")
         return
 
-    title = album["title"]
-    files = album["files"]
-
-    if not title:
-        await update.message.reply_text("还没有标题（需要一条以 # 开头的消息）")
+    if not album["title"]:
+        await update.message.reply_text("你还没有发送标题（需要以 # 开头）")
         return
-    if not files:
+    if not album["files"]:
         await update.message.reply_text("你还没有发送任何图片。")
         return
 
     try:
         code = next_code()
-    except Exception as e:
-        logger.exception("生成序列码失败")
-        await update.message.reply_text("生成序列码失败，请稍后重试。")
+    except Exception:
+        await update.message.reply_text("生成序列码失败，请稍后再试。")
         return
 
-    data = {
-        "title": title,
-        "files": files,
-        "attachments": album["attachments"],
-        "zip": album["zip"],
-        "password": album["password"],
-    }
-
-    ok = kv_put(code, json.dumps(data, ensure_ascii=False))
+    data = json.dumps(album, ensure_ascii=False)
+    ok = kv_put(code, data)
     if not ok:
-        await update.message.reply_text("❌ 写入图包数据失败，请稍后再试。")
+        await update.message.reply_text("❌ 写入图包失败，请稍后再试。")
         return
 
     del current_albums[uid]
 
-    link = f"{WORKER_BASE_URL}/{code}"
     await update.message.reply_text(
         f"🎉 图包已创建！\n"
         f"序列码：{code}\n"
-        f"访问链接：{link}\n\n"
-        f"你可以在网页打开，也可以访问 {WORKER_BASE_URL}/list 查看全部图包。"
+        f"访问链接：{WORKER_BASE_URL}/{code}"
     )
 
 async def handle_title(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     album = current_albums.get(uid)
     text = (update.message.text or "").strip()
-    
-    logger.info(f"[handle_title] User {uid} sent: '{text}', album exists: {album is not None}")
-    
+
     if not album:
-        logger.info(f"[handle_title] No album for user {uid}, ignoring message")
         if text.startswith("#"):
-            logger.info(f"[handle_title] User {uid} tried to set title without /start_album")
-            await update.message.reply_text("请先发送 /start_album 开始新的图包")
+            await update.message.reply_text("请先发送 /start_album 开始新图包")
         return
 
     if not text.startswith("#"):
-        logger.info(f"[handle_title] Message does not start with #, ignoring")
         return
-    
+
     if album["title"] is not None:
-        logger.info(f"[handle_title] Title already set for user {uid}: '{album['title']}'")
-        await update.message.reply_text(f"✅ 标题已设置为：{album['title']}\n(如需修改，请重新发送 /start_album)")
+        await update.message.reply_text(
+            f"标题已设置为：{album['title']}"
+        )
         return
-    
+
     album["title"] = text[1:].strip()
-    logger.info(f"[handle_title] Title set for user {uid}: '{album['title']}'")
     await update.message.reply_text(
-        f"✅ 标题已设置为：{album['title']}\n"
-        f"现在请继续发送本套写真所有图片。"
+        f"✅ 标题已设置为：{album['title']}\n请继续发送图片。"
     )
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     album = current_albums.get(uid)
-    logger.info(f"[handle_photo] User {uid} sent photo, album exists: {album is not None}")
     if not album:
-        logger.info(f"[handle_photo] No album for user {uid}, ignoring photo")
         return
-    photos = update.message.photo
-    if not photos:
-        logger.info(f"[handle_photo] No photos in message for user {uid}")
-        return
-    best = photos[-1]
-    file_id = best.file_id
-    album["files"].append(file_id)
-    logger.info(f"[handle_photo] Added photo {file_id} for user {uid}, total photos: {len(album['files'])}")
+    best = update.message.photo[-1]
+    album["files"].append(best.file_id)
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     album = current_albums.get(uid)
-    logger.info(f"[handle_document] User {uid} sent document, album exists: {album is not None}")
     if not album:
-        logger.info(f"[handle_document] No album for user {uid}, ignoring document")
         return
 
     doc = update.message.document
-    if not doc:
-        logger.info(f"[handle_document] No document in message for user {uid}")
-        return
-
     file_id = doc.file_id
-    file_name = doc.file_name or "file"
-    mime_type = doc.mime_type or "application/octet-stream"
+    fname = doc.file_name or "file"
+    mime = doc.mime_type or "application/octet-stream"
 
-    # 记录到 attachments
     album["attachments"].append({
         "file_id": file_id,
-        "file_name": file_name,
-        "mime_type": mime_type,
+        "file_name": fname,
+        "mime_type": mime,
     })
-    logger.info(f"[handle_document] Added document {file_name} ({file_id}) for user {uid}, total attachments: {len(album['attachments'])}")
 
-    # 如是 zip/7z/rar，则设为 zip（仅第一次）
-    lname = file_name.lower()
+    lname = fname.lower()
     if album["zip"] is None and (lname.endswith(".zip") or lname.endswith(".7z") or lname.endswith(".rar")):
         album["zip"] = {
             "file_id": file_id,
-            "file_name": file_name,
-            "mime_type": mime_type,
+            "file_name": fname,
+            "mime_type": mime,
         }
-        logger.info(f"[handle_document] Set zip file for user {uid}: {file_name}")
-        await update.message.reply_text(f"🎁 已设此文件为压缩包下载：{file_name}")
+        await update.message.reply_text(f"🎁 已设 {fname} 为压缩包下载文件")
 
 async def set_pass(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     album = current_albums.get(uid)
-    logger.info(f"[set_pass] User {uid} set password, album exists: {album is not None}")
     if not album:
-        logger.info(f"[set_pass] No album for user {uid}")
-        await update.message.reply_text("当前没有正在创建的图包，请先 /start_album。")
+        await update.message.reply_text("请先 /start_album 再设置密码。")
         return
 
-    text = update.message.text or ""
-    parts = text.strip().split(maxsplit=1)
+    parts = update.message.text.strip().split(maxsplit=1)
     if len(parts) < 2:
-        await update.message.reply_text("用法：/set_pass 你的密码\n例如：/set_pass 1234")
+        await update.message.reply_text("用法：/set_pass 密码")
         return
 
-    password = parts[1].strip()
-    album["password"] = password
-    logger.info(f"[set_pass] Password set for user {uid}: {password}")
-    await update.message.reply_text(f"🔒 已为当前图包设置密码：{password}\n访问网页时需要输入该密码。")
-
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await start(update, context)
+    album["password"] = parts[1]
+    await update.message.reply_text(f"🔒 当前图包密码已设置为：{parts[1]}")
 
 async def delete_album(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    text = update.message.text or ""
-    parts = text.strip().split(maxsplit=1)
-    
+    parts = update.message.text.strip().split(maxsplit=1)
     if len(parts) < 2:
-        await update.message.reply_text(
-            "❌ 请输入正确的序列码，例如：/delete a01"
-        )
+        await update.message.reply_text("用法：/delete a01")
         return
-    
+
     code = parts[1].strip().lower()
-    
-    if not code:
-        await update.message.reply_text(
-            "❌ 请输入正确的序列码，例如：/delete a01"
-        )
-        return
-    
     album_data = kv_get(code)
-    if album_data is None:
+    if not album_data:
         await update.message.reply_text(f"❌ 图包不存在：{code}")
         return
-    
-    try:
-        album = json.loads(album_data)
-    except (json.JSONDecodeError, ValueError):
-        await update.message.reply_text(f"❌ 图包数据格式错误：{code}")
-        return
-    
+
+    album = json.loads(album_data)
     title = album.get("title", "未知标题")
-    files_count = len(album.get("files", []))
-    
+    count = len(album.get("files", []))
+
     pending_deletes[uid] = code
-    
+
     await update.message.reply_text(
-        f"📋 图包信息预览：\n"
+        f"📋 图包信息：\n"
         f"序列码：{code}\n"
         f"标题：{title}\n"
-        f"图片数：{files_count}\n\n"
-        f"确定要删除《{title}》吗？(yes/no)"
+        f"图片数：{count}\n\n"
+        f"确定删除吗？（yes/no）"
     )
 
 async def handle_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    
-    logger.info(f"[handle_confirmation] User {uid} in pending_deletes: {uid in pending_deletes}")
-    
+
     if uid not in pending_deletes:
-        logger.info(f"[handle_confirmation] User {uid} not in pending_deletes, skipping")
         return
-    
+
     text = (update.message.text or "").strip().lower()
-    
-    logger.info(f"[handle_confirmation] Processing confirmation for user {uid}: '{text}'")
-    
-    if text not in ["yes", "no"]:
-        logger.info(f"[handle_confirmation] Invalid confirmation text: '{text}', expecting 'yes' or 'no'")
+    if text not in ("yes", "no"):
         await update.message.reply_text("请回复 yes 或 no")
         return
-    
+
     code = pending_deletes[uid]
-    
+
     if text == "no":
         del pending_deletes[uid]
-        logger.info(f"[handle_confirmation] User {uid} cancelled deletion of {code}")
-        await update.message.reply_text(f"❌ 已取消删除图包 {code}")
+        await update.message.reply_text("❌ 已取消删除。")
         return
-    
-    if text == "yes":
-        ok = kv_delete(code)
-        if ok:
-            del pending_deletes[uid]
-            logger.info(f"[handle_confirmation] User {uid} successfully deleted {code}")
-            await update.message.reply_text(f"✅ 已删除图包 {code}")
-        else:
-            del pending_deletes[uid]
-            logger.info(f"[handle_confirmation] Failed to delete {code} for user {uid}")
-            await update.message.reply_text(f"❌ 删除图包失败，请稍后重试：{code}")
+
+    ok = kv_delete(code)
+    del pending_deletes[uid]
+
+    if ok:
+        await update.message.reply_text(f"✅ 已成功删除图包：{code}")
+    else:
+        await update.message.reply_text("❌ 删除失败，请稍后再试。")
+
 
 def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CommandHandler("help", start))
     app.add_handler(CommandHandler("start_album", start_album))
     app.add_handler(CommandHandler("end_album", end_album))
     app.add_handler(CommandHandler("set_pass", set_pass))
     app.add_handler(CommandHandler("delete", delete_album))
 
-    # MessageHandlers must be ordered from most specific to least specific
-    # handle_confirmation only processes messages when user is in pending_deletes
-    # handle_title processes messages starting with # when album exists
-    # Other photo/document handlers must come after text handlers
-    logger.info("[main] Registering message handlers in order: confirmation, title, photo, document")
-    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_title))
-    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_confirmation))
+    # 删除确认（优先处理）
+    app.add_handler(
+        MessageHandler(
+            filters.Regex(r"^(?i)(yes|no)$"),
+            handle_confirmation
+        )
+    )
+
+    # 标题（# 开头）
+    app.add_handler(
+        MessageHandler(
+            filters.Regex(r"^#"),
+            handle_title
+        )
+    )
+
+    # 图片
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+
+    # 文件
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
 
-    logger.info("[main] Bot is starting...")
+    logger.info("Bot is running...")
     app.run_polling()
 
 

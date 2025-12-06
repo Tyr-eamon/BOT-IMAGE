@@ -19,6 +19,8 @@ WORKER_BASE_URL = os.getenv("WORKER_BASE_URL", "https://example.workers.dev")
 
 # user_id -> 临时图包数据
 current_albums = {}
+# user_id -> 待确认删除的图包代码
+pending_deletes = {}
 COUNTER_KEY = "__counter"
 
 
@@ -41,6 +43,11 @@ def kv_put(key: str, value: str):
     url = f"{kv_base_url()}/values/{key}"
     resp = requests.put(url, headers=kv_headers(), data=value.encode("utf-8"))
     return resp.status_code == 200
+
+def kv_delete(key: str):
+    url = f"{kv_base_url()}/values/{key}"
+    resp = requests.delete(url, headers=kv_headers())
+    return resp.status_code == 204
 
 def next_code() -> str:
     cur = kv_get(COUNTER_KEY)
@@ -217,6 +224,76 @@ async def set_pass(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await start(update, context)
 
+async def delete_album(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    text = update.message.text or ""
+    parts = text.strip().split(maxsplit=1)
+    
+    if len(parts) < 2:
+        await update.message.reply_text(
+            "❌ 请输入正确的序列码，例如：/delete a01"
+        )
+        return
+    
+    code = parts[1].strip().lower()
+    
+    if not code:
+        await update.message.reply_text(
+            "❌ 请输入正确的序列码，例如：/delete a01"
+        )
+        return
+    
+    album_data = kv_get(code)
+    if album_data is None:
+        await update.message.reply_text(f"❌ 图包不存在：{code}")
+        return
+    
+    try:
+        album = json.loads(album_data)
+    except (json.JSONDecodeError, ValueError):
+        await update.message.reply_text(f"❌ 图包数据格式错误：{code}")
+        return
+    
+    title = album.get("title", "未知标题")
+    files_count = len(album.get("files", []))
+    
+    pending_deletes[uid] = code
+    
+    await update.message.reply_text(
+        f"📋 图包信息预览：\n"
+        f"序列码：{code}\n"
+        f"标题：{title}\n"
+        f"图片数：{files_count}\n\n"
+        f"确定要删除《{title}》吗？(yes/no)"
+    )
+
+async def handle_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    
+    if uid not in pending_deletes:
+        return
+    
+    text = (update.message.text or "").strip().lower()
+    
+    if text not in ["yes", "no"]:
+        return
+    
+    code = pending_deletes[uid]
+    
+    if text == "no":
+        del pending_deletes[uid]
+        await update.message.reply_text(f"❌ 已取消删除图包 {code}")
+        return
+    
+    if text == "yes":
+        ok = kv_delete(code)
+        if ok:
+            del pending_deletes[uid]
+            await update.message.reply_text(f"✅ 已删除图包 {code}")
+        else:
+            del pending_deletes[uid]
+            await update.message.reply_text(f"❌ 删除图包失败，请稍后重试：{code}")
+
 def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
@@ -225,7 +302,9 @@ def main():
     app.add_handler(CommandHandler("start_album", start_album))
     app.add_handler(CommandHandler("end_album", end_album))
     app.add_handler(CommandHandler("set_pass", set_pass))
+    app.add_handler(CommandHandler("delete", delete_album))
 
+    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_confirmation))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_title))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))

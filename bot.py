@@ -347,8 +347,8 @@ def main():
     # handle_title processes messages starting with # when album exists
     # Other photo/document handlers must come after text handlers
     logger.info("[main] Registering message handlers in order: confirmation, title, photo, document")
-    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_title))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_confirmation))
+    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_title))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
 

@@ -15,6 +15,13 @@ logger = logging.getLogger(__name__)
 OWNER_ID = 8040798522 
 ALLOWED_USERS = set([OWNER_ID])
 
+# 1. 频道设置 (新增功能)
+# 频道 ID (必须带 -100，如果没有配置则不启用转发)
+CHANNEL_ID = int(os.environ.get("CHANNEL_ID", "0"))
+# 链接前缀 (私有频道去掉 -100，例如 https://t.me/c/123456)
+CHANNEL_LINK_PREFIX = os.environ.get("CHANNEL_LINK_PREFIX", "")
+
+# 2. 基础配置
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 CF_ACCOUNT_ID = os.environ["CF_ACCOUNT_ID"]
 CF_NAMESPACE_ID = os.environ["CF_NAMESPACE_ID"]
@@ -56,7 +63,7 @@ def next_code():
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await ensure_allowed(update): return
     await update.message.reply_text(
-        "📸 **Bot Ready**\n"
+        "📸 **Bot Ready (Channel Mode)**\n"
         "🔹 /start_album - 开始\n"
         "🔹 直接发消息 - 设标题\n"
         "🔹 /nav - 选分类\n"
@@ -80,7 +87,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     text = update.message.text.strip()
 
-    # 1. 优先处理删除确认
+    # 1. 删除确认
     if uid in pending_deletes:
         if text.lower() == "yes":
             code = pending_deletes.pop(uid)
@@ -144,7 +151,7 @@ async def end_album(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await ensure_allowed(update): return
     uid = update.effective_user.id
     album = current_albums.get(uid)
-    if not album or not album["files"]: return await update.message.reply_text("无数据")
+    if not album or (not album["files"] and not album["attachments"]): return await update.message.reply_text("无数据")
     
     code = next_code()
     if kv_put(code, json.dumps(album, ensure_ascii=False)):
@@ -153,20 +160,57 @@ async def end_album(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("❌ 失败")
 
+# --- 核心修改：媒体处理逻辑 ---
 async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await ensure_allowed(update): return
     uid = update.effective_user.id
     album = current_albums.get(uid)
     if not album: return
     
-    if update.message.photo: album["files"].append(update.message.photo[-1].file_id)
-    elif update.message.document:
-        doc = update.message.document
-        info = {"file_id": doc.file_id, "file_name": doc.file_name, "mime_type": doc.mime_type}
+    msg = update.message
+
+    # 1. 图片：依然存 file_id (用于封面和预览，图片一般不大，走代理没问题)
+    if msg.photo:
+        album["files"].append(msg.photo[-1].file_id)
+        # 如果你想让图片也转发到频道，可以在这里加 forward 逻辑，但通常不需要
+    
+    # 2. 视频/文件：转发到频道，获取链接
+    elif msg.video or msg.document:
+        fname = "file"
+        if msg.video: fname = msg.video.file_name or "video.mp4"
+        elif msg.document: fname = msg.document.file_name or "file"
+
+        # 检查是否配置了频道
+        if CHANNEL_ID != 0 and CHANNEL_LINK_PREFIX:
+            try:
+                # 转发!
+                forwarded = await msg.forward(chat_id=CHANNEL_ID)
+                msg_id = forwarded.message_id
+                # 生成跳转链接
+                tg_link = f"{CHANNEL_LINK_PREFIX}/{msg_id}"
+                
+                info = {"file_name": fname, "tg_link": tg_link, "type": "tg_link"}
+                album["attachments"].append(info)
+                
+                # 自动识别 Zip
+                if not album["zip"] and fname.lower().endswith((".zip", ".rar", ".7z")):
+                    album["zip"] = info
+                
+                await update.message.reply_text(f"✈️ 已存频道：{fname}")
+                return # 结束，不再往下走
+            except Exception as e:
+                logger.error(f"Forward error: {e}")
+                await update.message.reply_text(f"❌ 转发失败 (请检查 Bot 是否是频道管理员)\n{e}")
+                # 转发失败则降级处理，尝试存 file_id (虽然可能下不动)
+        
+        # 降级逻辑 (如果没有配置频道，或者转发失败)
+        file_id = msg.video.file_id if msg.video else msg.document.file_id
+        mime = msg.video.mime_type if msg.video else msg.document.mime_type
+        info = {"file_id": file_id, "file_name": fname, "mime_type": mime}
         album["attachments"].append(info)
-        if not album["zip"] and doc.file_name.lower().endswith((".zip", ".rar", ".7z")):
+        if not album["zip"] and fname.lower().endswith((".zip", ".rar", ".7z")):
             album["zip"] = info
-            await update.message.reply_text(f"🎁 Zip: {doc.file_name}")
+        await update.message.reply_text(f"📄 已添加 (本地模式): {fname}")
 
 # --- 管理功能 ---
 async def allow_user(update: Update, context: ContextTypes.DEFAULT_TYPE):

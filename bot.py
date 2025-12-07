@@ -2,19 +2,17 @@ import os
 import json
 import logging
 import requests
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder, CommandHandler,
-    MessageHandler, ContextTypes, filters
+    MessageHandler, ContextTypes, filters, CallbackQueryHandler
 )
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# 你的 Telegram ID（超级管理员）
+# 你的 Telegram ID
 OWNER_ID = 8040798522  
-
-# 白名单（允许使用 bot 的用户）
 ALLOWED_USERS = set([OWNER_ID])
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
@@ -23,361 +21,194 @@ CF_NAMESPACE_ID = os.environ["CF_NAMESPACE_ID"]
 CF_API_TOKEN = os.environ["CF_API_TOKEN"]
 WORKER_BASE_URL = os.getenv("WORKER_BASE_URL", "https://example.workers.dev")
 
-# user_id -> 临时图包数据
+# 自定义分类 (需与 Worker 端保持一致)
+CATEGORIES = [
+    "Popular Cosplay",
+    "Video Cosplay",
+    "Explore Categories",
+    "Best Cosplayer",
+    "Level Cosplay",
+    "Top Cosplay"
+]
+
 current_albums = {}
-# user_id -> 待确认删除的图包代码
 pending_deletes = {}
 COUNTER_KEY = "__counter"
 
-
-# ---------- 权限检查 ----------
+# ---------- 权限 ----------
 def is_allowed(uid: int) -> bool:
     return uid == OWNER_ID or uid in ALLOWED_USERS
 
 async def ensure_allowed(update: Update):
     uid = update.effective_user.id
     if not is_allowed(uid):
-        await update.message.reply_text("❌ 你没有权限使用此 Bot。")
+        await update.message.reply_text("❌ 无权使用。")
         return False
     return True
 
-
-# ---------- Cloudflare KV ----------
+# ---------- KV ----------
 def kv_headers():
-    return {
-        "Authorization": f"Bearer {CF_API_TOKEN}",
-        "Content-Type": "text/plain",
-    }
-
-def kv_base_url():
-    return f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/storage/kv/namespaces/{CF_NAMESPACE_ID}"
-
-def kv_get(key: str):
-    url = f"{kv_base_url()}/values/{key}"
-    resp = requests.get(url, headers=kv_headers())
-    return resp.text if resp.status_code == 200 else None
+    return {"Authorization": f"Bearer {CF_API_TOKEN}", "Content-Type": "text/plain"}
 
 def kv_put(key: str, value: str):
-    url = f"{kv_base_url()}/values/{key}"
+    url = f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/storage/kv/namespaces/{CF_NAMESPACE_ID}/values/{key}"
     resp = requests.put(url, headers=kv_headers(), data=value.encode("utf-8"))
     return resp.status_code == 200
 
+def kv_get(key: str):
+    url = f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/storage/kv/namespaces/{CF_NAMESPACE_ID}/values/{key}"
+    resp = requests.get(url, headers=kv_headers())
+    return resp.text if resp.status_code == 200 else None
+
 def kv_delete(key: str):
-    url = f"{kv_base_url()}/values/{key}"
+    url = f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/storage/kv/namespaces/{CF_NAMESPACE_ID}/values/{key}"
     resp = requests.delete(url, headers=kv_headers())
     return resp.status_code in (200, 204)
 
 def next_code() -> str:
     cur = kv_get(COUNTER_KEY)
-    if cur is None:
-        n = 1
-    else:
-        try:
-            n = int(cur) + 1
-        except ValueError:
-            n = 1
-
+    n = int(cur) + 1 if cur else 1
     kv_put(COUNTER_KEY, str(n))
+    return f"a0{n}" if n < 10 else f"a{n}"
 
-    if n < 10:
-        return f"a0{n}"
-    return f"a{n}"
-
-
-# ---------- Bot 逻辑 ----------
+# ---------- Bot Logic ----------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await ensure_allowed(update): return
     await update.message.reply_text(
-        "📸 写真图包 Bot 已就绪\n\n"
-        "/start_album  开始新图包\n"
-        "#标题          设置图包标题\n"
-        "发送图片       可一次拖几十张\n"
-        "/set_pass 1234 设置访问密码\n"
-        "/end_album     结束并生成图包\n"
-        "/delete a01    删除图包（yes/no 确认）\n"
-        "\n管理员命令：\n"
-        "/allow <id> 添加白名单\n"
-        "/deny <id> 移除白名单\n"
-        "/list_users 查看白名单\n"
+        "📸 **MTCweb Bot**\n\n"
+        "1️⃣ /start_album - 开始\n"
+        "2️⃣ 发送 `#标题` - 设置标题并选择分类\n"
+        "3️⃣ 发送图片/文件\n"
+        "4️⃣ /end_album - 完成\n"
     )
 
 async def start_album(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await ensure_allowed(update): return
-
     uid = update.effective_user.id
     current_albums[uid] = {
         "title": None,
+        "category": CATEGORIES[2], # 默认值 "Explore Categories"
         "files": [],
         "attachments": [],
         "zip": None,
         "password": None,
     }
-    await update.message.reply_text(
-        "🟦 已开始新的图包\n"
-        "请发送标题（以 # 开头）\n"
-        "然后发送所有图片（可一次拖很多张）\n"
-        "如需设置密码：/set_pass 1234\n"
-        "结束图包：/end_album"
-    )
-
-async def end_album(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await ensure_allowed(update): return
-
-    uid = update.effective_user.id
-    album = current_albums.get(uid)
-    if not album:
-        await update.message.reply_text("请先发送 /start_album")
-        return
-
-    if not album["title"]:
-        await update.message.reply_text("你还没有设置标题（需 # 开头）")
-        return
-    if not album["files"]:
-        await update.message.reply_text("你还没有发送任何图片。")
-        return
-
-    code = next_code()
-
-    ok = kv_put(code, json.dumps(album, ensure_ascii=False))
-    if not ok:
-        await update.message.reply_text("❌ 写入图包失败。")
-        return
-
-    del current_albums[uid]
-
-    await update.message.reply_text(
-        f"🎉 图包已创建！\n"
-        f"序列码：{code}\n"
-        f"访问：{WORKER_BASE_URL}/{code}"
-    )
+    await update.message.reply_text("🟦 新图包已开始。\n请发送标题（以 # 开头），例如：`#Arty Genshin`", parse_mode="Markdown")
 
 async def handle_title(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await ensure_allowed(update): return
-
     uid = update.effective_user.id
-    album = current_albums.get(uid)
     text = update.message.text.strip()
+    album = current_albums.get(uid)
 
     if not album:
-        if text.startswith("#"):
-            await update.message.reply_text("请先 /start_album")
+        if text.startswith("#"): await update.message.reply_text("请先 /start_album")
         return
 
-    if not text.startswith("#"):
-        return
+    if not text.startswith("#"): return
 
-    if album["title"] is not None:
-        await update.message.reply_text(f"标题已设置为：{album['title']}")
-        return
-
+    # 1. 保存标题
     album["title"] = text[1:].strip()
-    await update.message.reply_text(f"标题已设置为：{album['title']}")
+
+    # 2. 构建分类选择键盘
+    keyboard = []
+    # 每行放2个按钮
+    for i in range(0, len(CATEGORIES), 2):
+        row = []
+        row.append(InlineKeyboardButton(CATEGORIES[i], callback_data=f"cat_{i}"))
+        if i + 1 < len(CATEGORIES):
+            row.append(InlineKeyboardButton(CATEGORIES[i+1], callback_data=f"cat_{i+1}"))
+        keyboard.append(row)
+
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text(f"✅ 标题已设为：{album['title']}\n\n👇 **请选择分类：**", reply_markup=reply_markup)
+
+async def handle_category_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    uid = query.from_user.id
+    data = query.data
+    
+    if not data.startswith("cat_"): return
+    
+    idx = int(data.split("_")[1])
+    selected_cat = CATEGORIES[idx]
+    
+    if uid in current_albums:
+        current_albums[uid]["category"] = selected_cat
+        await query.edit_message_text(f"✅ 标题：{current_albums[uid]['title']}\n✅ 分类：**{selected_cat}**\n\n现在请发送图片或文件。")
+    else:
+        await query.edit_message_text("❌ 会话已过期，请重新开始。")
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await ensure_allowed(update): return
-
     uid = update.effective_user.id
-    album = current_albums.get(uid)
-    if not album: return
-
-    best = update.message.photo[-1]
-    album["files"].append(best.file_id)
+    if uid in current_albums:
+        current_albums[uid]["files"].append(update.message.photo[-1].file_id)
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await ensure_allowed(update): return
-
     uid = update.effective_user.id
     album = current_albums.get(uid)
     if not album: return
 
     doc = update.message.document
-    file_id = doc.file_id
-    fname = doc.file_name or "file"
-    mime = doc.mime_type or "application/octet-stream"
+    file_info = {"file_id": doc.file_id, "file_name": doc.file_name or "file", "mime_type": doc.mime_type}
+    album["attachments"].append(file_info)
+    
+    lname = doc.file_name.lower() if doc.file_name else ""
+    if not album["zip"] and (lname.endswith(".zip") or lname.endswith(".rar") or lname.endswith(".7z")):
+        album["zip"] = file_info
+        await update.message.reply_text(f"🎁 识别为压缩包：{doc.file_name}")
 
-    album["attachments"].append({
-        "file_id": file_id,
-        "file_name": fname,
-        "mime_type": mime,
-    })
-
-    lname = fname.lower()
-    if album["zip"] is None and (lname.endswith(".zip") or lname.endswith(".rar") or lname.endswith(".7z")):
-        album["zip"] = {
-            "file_id": file_id,
-            "file_name": fname,
-            "mime_type": mime,
-        }
-        await update.message.reply_text(f"🎁 已设 {fname} 为压缩包文件")
-
-async def set_pass(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def end_album(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await ensure_allowed(update): return
-
     uid = update.effective_user.id
     album = current_albums.get(uid)
-    if not album:
-        await update.message.reply_text("请先 /start_album")
-        return
+    
+    if not album: return await update.message.reply_text("未开始新图包")
+    if not album["files"]: return await update.message.reply_text("未发送图片")
 
-    parts = update.message.text.strip().split(maxsplit=1)
-    if len(parts) < 2:
-        await update.message.reply_text("用法：/set_pass 密码")
-        return
-
-    album["password"] = parts[1]
-    await update.message.reply_text(f"密码已设置为：{parts[1]}")
+    code = next_code()
+    kv_put(code, json.dumps(album, ensure_ascii=False))
+    del current_albums[uid]
+    
+    await update.message.reply_text(f"🎉 发布成功！\nCode: `{code}`\nLink: {WORKER_BASE_URL}/{code}", parse_mode="Markdown")
 
 async def delete_album(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await ensure_allowed(update): return
-
-    uid = update.effective_user.id
-    parts = update.message.text.strip().split(maxsplit=1)
-    if len(parts) < 2:
+    try:
+        code = update.message.text.split()[1]
+        pending_deletes[update.effective_user.id] = code
+        await update.message.reply_text(f"确认删除 {code}？回复 yes")
+    except:
         await update.message.reply_text("用法：/delete a01")
-        return
 
-    code = parts[1].lower()
-    album_data = kv_get(code)
-    if not album_data:
-        await update.message.reply_text(f"图包不存在：{code}")
-        return
-
-    album = json.loads(album_data)
-    title = album.get("title", "未知标题")
-    count = len(album.get("files", []))
-
-    pending_deletes[uid] = code
-
-    await update.message.reply_text(
-        f"📋 图包信息：\n序列码：{code}\n标题：{title}\n图片数：{count}\n\n"
-        f"确定删除吗？（yes/no）"
-    )
-
-async def handle_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
+    if uid in pending_deletes and update.message.text.lower() == "yes":
+        code = pending_deletes.pop(uid)
+        kv_delete(code)
+        await update.message.reply_text(f"已删除 {code}")
 
-    if uid not in pending_deletes:
-        return
-
-    text = update.message.text.strip().lower()
-
-    if text not in ("yes", "no"):
-        await update.message.reply_text("请回复 yes 或 no")
-        return
-
-    code = pending_deletes[uid]
-
-    if text == "no":
-        del pending_deletes[uid]
-        await update.message.reply_text("已取消删除。")
-        return
-
-    ok = kv_delete(code)
-    del pending_deletes[uid]
-
-    if ok:
-        await update.message.reply_text(f"已删除图包：{code}")
-    else:
-        await update.message.reply_text("删除失败，请稍后再试。")
-
-
-# ---------- 管理员命令（白名单） ----------
-
-async def allow_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    if uid != OWNER_ID:
-        await update.message.reply_text("❌ 只有管理员能管理用户。")
-        return
-
-    parts = update.message.text.strip().split()
-    if len(parts) != 2:
-        await update.message.reply_text("用法：/allow 用户ID")
-        return
-
-    try:
-        target = int(parts[1])
-    except:
-        await update.message.reply_text("用户 ID 必须是数字。")
-        return
-
-    ALLOWED_USERS.add(target)
-    await update.message.reply_text(f"✅ 已加入白名单：{target}")
-
-async def deny_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    if uid != OWNER_ID:
-        await update.message.reply_text("❌ 只有管理员能管理用户。")
-        return
-
-    parts = update.message.text.strip().split()
-    if len(parts) != 2:
-        await update.message.reply_text("用法：/deny 用户ID")
-        return
-
-    try:
-        target = int(parts[1])
-    except:
-        await update.message.reply_text("用户 ID 必须是数字。")
-        return
-
-    if target in ALLOWED_USERS:
-        ALLOWED_USERS.remove(target)
-
-    await update.message.reply_text(f"⛔ 已移出白名单：{target}")
-
-async def list_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    if uid != OWNER_ID:
-        await update.message.reply_text("❌ 你没有权限查看用户列表。")
-        return
-
-    text = "\n".join(str(u) for u in ALLOWED_USERS)
-    await update.message.reply_text(f"📋 白名单用户：\n{text}")
-
-
-# ---------- 注册 ----------
 def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
-
-    # 用户命令
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", start))
     app.add_handler(CommandHandler("start_album", start_album))
     app.add_handler(CommandHandler("end_album", end_album))
-    app.add_handler(CommandHandler("set_pass", set_pass))
     app.add_handler(CommandHandler("delete", delete_album))
-
-    # 管理命令
-    app.add_handler(CommandHandler("allow", allow_user))
-    app.add_handler(CommandHandler("deny", deny_user))
-    app.add_handler(CommandHandler("list_users", list_users))
-
-    # 删除确认（yes/no）必须最优先匹配
-    app.add_handler(
-        MessageHandler(
-            filters.Regex(r"^(?i)(yes|no)$"),
-            handle_confirmation
-        )
-    )
-
-    # 标题处理
-    app.add_handler(
-        MessageHandler(
-            filters.Regex(r"^#"),
-            handle_title
-        )
-    )
-
-    # 图片
+    
+    app.add_handler(MessageHandler(filters.Regex(r"^#"), handle_title))
+    app.add_handler(CallbackQueryHandler(handle_category_callback))
+    
+    app.add_handler(MessageHandler(filters.Regex(r"^(?i)yes$"), handle_confirm))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
-
-    # 文件（zip、apk、txt 等）
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
-
-    logger.info("Bot is running...")
+    
+    logger.info("Bot running...")
     app.run_polling()
-
 
 if __name__ == "__main__":
     main()
